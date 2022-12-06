@@ -1,15 +1,15 @@
-import functools
-from collections import defaultdict
-from typing import Any, Callable, Dict, List, Sequence, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 
 import PIL.Image
 
 import torch
+
 from torchvision.ops import remove_small_boxes
-from torchvision.prototype import features
+from torchvision.prototype import datapoints
 from torchvision.prototype.transforms import functional as F, Transform
 
-from ._utils import _setup_float_or_seq, _setup_size, has_any, query_bounding_box
+from ._utils import _get_defaultdict, _setup_float_or_seq, _setup_size
+from .utils import has_any, is_simple_tensor, query_bounding_box
 
 
 class Identity(Transform):
@@ -39,7 +39,7 @@ class Lambda(Transform):
 
 
 class LinearTransformation(Transform):
-    _transformed_types = (features.is_simple_tensor, features.Image, features.Video)
+    _transformed_types = (is_simple_tensor, datapoints.Image, datapoints.Video)
 
     def __init__(self, transformation_matrix: torch.Tensor, mean_vector: torch.Tensor):
         super().__init__()
@@ -68,7 +68,7 @@ class LinearTransformation(Transform):
             raise TypeError("LinearTransformation does not work on PIL Images")
 
     def _transform(
-        self, inpt: Union[features.TensorImageType, features.TensorVideoType], params: Dict[str, Any]
+        self, inpt: Union[datapoints.TensorImageType, datapoints.TensorVideoType], params: Dict[str, Any]
     ) -> torch.Tensor:
         # Image instance after linear transformation is not Image anymore due to unknown data range
         # Thus we will return Tensor for input Image
@@ -94,7 +94,7 @@ class LinearTransformation(Transform):
 
 
 class Normalize(Transform):
-    _transformed_types = (features.Image, features.is_simple_tensor, features.Video)
+    _transformed_types = (datapoints.Image, is_simple_tensor, datapoints.Video)
 
     def __init__(self, mean: Sequence[float], std: Sequence[float], inplace: bool = False):
         super().__init__()
@@ -107,7 +107,7 @@ class Normalize(Transform):
             raise TypeError(f"{type(self).__name__}() does not support PIL images.")
 
     def _transform(
-        self, inpt: Union[features.TensorImageType, features.TensorVideoType], params: Dict[str, Any]
+        self, inpt: Union[datapoints.TensorImageType, datapoints.TensorVideoType], params: Dict[str, Any]
     ) -> torch.Tensor:
         return F.normalize(inpt, mean=self.mean, std=self.std, inplace=self.inplace)
 
@@ -145,15 +145,10 @@ class GaussianBlur(Transform):
 class ToDtype(Transform):
     _transformed_types = (torch.Tensor,)
 
-    def _default_dtype(self, dtype: torch.dtype) -> torch.dtype:
-        return dtype
-
-    def __init__(self, dtype: Union[torch.dtype, Dict[Type, torch.dtype]]) -> None:
+    def __init__(self, dtype: Union[torch.dtype, Dict[Type, Optional[torch.dtype]]]) -> None:
         super().__init__()
         if not isinstance(dtype, dict):
-            # This weird looking construct only exists, since `lambda`'s cannot be serialized by pickle.
-            # If it were possible, we could replace this with `defaultdict(lambda: dtype)`
-            dtype = defaultdict(functools.partial(self._default_dtype, dtype))
+            dtype = _get_defaultdict(dtype)
         self.dtype = dtype
 
     def _transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
@@ -163,8 +158,44 @@ class ToDtype(Transform):
         return inpt.to(dtype=dtype)
 
 
+class PermuteDimensions(Transform):
+    _transformed_types = (is_simple_tensor, datapoints.Image, datapoints.Video)
+
+    def __init__(self, dims: Union[Sequence[int], Dict[Type, Optional[Sequence[int]]]]) -> None:
+        super().__init__()
+        if not isinstance(dims, dict):
+            dims = _get_defaultdict(dims)
+        self.dims = dims
+
+    def _transform(
+        self, inpt: Union[datapoints.TensorImageType, datapoints.TensorVideoType], params: Dict[str, Any]
+    ) -> torch.Tensor:
+        dims = self.dims[type(inpt)]
+        if dims is None:
+            return inpt.as_subclass(torch.Tensor)
+        return inpt.permute(*dims)
+
+
+class TransposeDimensions(Transform):
+    _transformed_types = (is_simple_tensor, datapoints.Image, datapoints.Video)
+
+    def __init__(self, dims: Union[Tuple[int, int], Dict[Type, Optional[Tuple[int, int]]]]) -> None:
+        super().__init__()
+        if not isinstance(dims, dict):
+            dims = _get_defaultdict(dims)
+        self.dims = dims
+
+    def _transform(
+        self, inpt: Union[datapoints.TensorImageType, datapoints.TensorVideoType], params: Dict[str, Any]
+    ) -> torch.Tensor:
+        dims = self.dims[type(inpt)]
+        if dims is None:
+            return inpt.as_subclass(torch.Tensor)
+        return inpt.transpose(*dims)
+
+
 class RemoveSmallBoundingBoxes(Transform):
-    _transformed_types = (features.BoundingBox, features.Mask, features.Label, features.OneHotLabel)
+    _transformed_types = (datapoints.BoundingBox, datapoints.Mask, datapoints.Label, datapoints.OneHotLabel)
 
     def __init__(self, min_size: float = 1.0) -> None:
         super().__init__()
@@ -178,7 +209,9 @@ class RemoveSmallBoundingBoxes(Transform):
         #  format,we need to convert first just to afterwards compute the width and height again, although they were
         #  there in the first place for these formats.
         bounding_box = F.convert_format_bounding_box(
-            bounding_box, old_format=bounding_box.format, new_format=features.BoundingBoxFormat.XYXY
+            bounding_box.as_subclass(torch.Tensor),
+            old_format=bounding_box.format,
+            new_format=datapoints.BoundingBoxFormat.XYXY,
         )
         valid_indices = remove_small_boxes(bounding_box, min_size=self.min_size)
 

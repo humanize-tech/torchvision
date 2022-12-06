@@ -1,18 +1,18 @@
 import math
-from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Type, TypeVar, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import PIL.Image
 import torch
 
 from torch.utils._pytree import tree_flatten, tree_unflatten, TreeSpec
-from torchvision.prototype import features
+
+from torchvision.prototype import datapoints
 from torchvision.prototype.transforms import AutoAugmentPolicy, functional as F, InterpolationMode, Transform
 from torchvision.prototype.transforms.functional._meta import get_spatial_size
+from torchvision.transforms import functional_tensor as _FT
 
-from ._utils import _isinstance, _setup_fill_arg
-
-K = TypeVar("K")
-V = TypeVar("V")
+from ._utils import _setup_fill_arg
+from .utils import check_type, is_simple_tensor
 
 
 class _AutoAugmentBase(Transform):
@@ -20,13 +20,13 @@ class _AutoAugmentBase(Transform):
         self,
         *,
         interpolation: InterpolationMode = InterpolationMode.NEAREST,
-        fill: Union[features.FillType, Dict[Type, features.FillType]] = None,
+        fill: Union[datapoints.FillType, Dict[Type, datapoints.FillType]] = None,
     ) -> None:
         super().__init__()
         self.interpolation = interpolation
         self.fill = _setup_fill_arg(fill)
 
-    def _get_random_item(self, dct: Dict[K, V]) -> Tuple[K, V]:
+    def _get_random_item(self, dct: Dict[str, Tuple[Callable, bool]]) -> Tuple[str, Tuple[Callable, bool]]:
         keys = tuple(dct.keys())
         key = keys[int(torch.randint(len(keys), ()))]
         return key, dct[key]
@@ -34,13 +34,21 @@ class _AutoAugmentBase(Transform):
     def _flatten_and_extract_image_or_video(
         self,
         inputs: Any,
-        unsupported_types: Tuple[Type, ...] = (features.BoundingBox, features.Mask),
-    ) -> Tuple[Tuple[List[Any], TreeSpec, int], Union[features.ImageType, features.VideoType]]:
+        unsupported_types: Tuple[Type, ...] = (datapoints.BoundingBox, datapoints.Mask),
+    ) -> Tuple[Tuple[List[Any], TreeSpec, int], Union[datapoints.ImageType, datapoints.VideoType]]:
         flat_inputs, spec = tree_flatten(inputs if len(inputs) > 1 else inputs[0])
 
         image_or_videos = []
         for idx, inpt in enumerate(flat_inputs):
-            if _isinstance(inpt, (features.Image, PIL.Image.Image, features.is_simple_tensor, features.Video)):
+            if check_type(
+                inpt,
+                (
+                    datapoints.Image,
+                    PIL.Image.Image,
+                    is_simple_tensor,
+                    datapoints.Video,
+                ),
+            ):
                 image_or_videos.append((idx, inpt))
             elif isinstance(inpt, unsupported_types):
                 raise TypeError(f"Inputs of type {type(inpt).__name__} are not supported by {type(self).__name__}()")
@@ -59,7 +67,7 @@ class _AutoAugmentBase(Transform):
     def _unflatten_and_insert_image_or_video(
         self,
         flat_inputs_with_spec: Tuple[List[Any], TreeSpec, int],
-        image_or_video: Union[features.ImageType, features.VideoType],
+        image_or_video: Union[datapoints.ImageType, datapoints.VideoType],
     ) -> Any:
         flat_inputs, spec, idx = flat_inputs_with_spec
         flat_inputs[idx] = image_or_video
@@ -67,14 +75,13 @@ class _AutoAugmentBase(Transform):
 
     def _apply_image_or_video_transform(
         self,
-        image: Union[features.ImageType, features.VideoType],
+        image: Union[datapoints.ImageType, datapoints.VideoType],
         transform_id: str,
         magnitude: float,
         interpolation: InterpolationMode,
-        fill: Dict[Type, features.FillType],
-    ) -> Union[features.ImageType, features.VideoType]:
+        fill: Dict[Type, datapoints.FillTypeJIT],
+    ) -> Union[datapoints.ImageType, datapoints.VideoType]:
         fill_ = fill[type(image)]
-        fill_ = F._geometry._convert_fill_arg(fill_)
 
         if transform_id == "Identity":
             return image
@@ -141,7 +148,8 @@ class _AutoAugmentBase(Transform):
         elif transform_id == "Posterize":
             return F.posterize(image, bits=int(magnitude))
         elif transform_id == "Solarize":
-            return F.solarize(image, threshold=magnitude)
+            bound = _FT._max_value(image.dtype) if isinstance(image, torch.Tensor) else 255.0
+            return F.solarize(image, threshold=bound * magnitude)
         elif transform_id == "AutoContrast":
             return F.autocontrast(image)
         elif transform_id == "Equalize":
@@ -170,12 +178,10 @@ class AutoAugment(_AutoAugmentBase):
         "Contrast": (lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins), True),
         "Sharpness": (lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins), True),
         "Posterize": (
-            lambda num_bins, height, width: cast(torch.Tensor, 8 - (torch.arange(num_bins) / ((num_bins - 1) / 4)))
-            .round()
-            .int(),
+            lambda num_bins, height, width: (8 - (torch.arange(num_bins) / ((num_bins - 1) / 4))).round().int(),
             False,
         ),
-        "Solarize": (lambda num_bins, height, width: torch.linspace(255.0, 0.0, num_bins), False),
+        "Solarize": (lambda num_bins, height, width: torch.linspace(1.0, 0.0, num_bins), False),
         "AutoContrast": (lambda num_bins, height, width: None, False),
         "Equalize": (lambda num_bins, height, width: None, False),
         "Invert": (lambda num_bins, height, width: None, False),
@@ -185,7 +191,7 @@ class AutoAugment(_AutoAugmentBase):
         self,
         policy: AutoAugmentPolicy = AutoAugmentPolicy.IMAGENET,
         interpolation: InterpolationMode = InterpolationMode.NEAREST,
-        fill: Union[features.FillType, Dict[Type, features.FillType]] = None,
+        fill: Union[datapoints.FillType, Dict[Type, datapoints.FillType]] = None,
     ) -> None:
         super().__init__(interpolation=interpolation, fill=fill)
         self.policy = policy
@@ -327,12 +333,10 @@ class RandAugment(_AutoAugmentBase):
         "Contrast": (lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins), True),
         "Sharpness": (lambda num_bins, height, width: torch.linspace(0.0, 0.9, num_bins), True),
         "Posterize": (
-            lambda num_bins, height, width: cast(torch.Tensor, 8 - (torch.arange(num_bins) / ((num_bins - 1) / 4)))
-            .round()
-            .int(),
+            lambda num_bins, height, width: (8 - (torch.arange(num_bins) / ((num_bins - 1) / 4))).round().int(),
             False,
         ),
-        "Solarize": (lambda num_bins, height, width: torch.linspace(255.0, 0.0, num_bins), False),
+        "Solarize": (lambda num_bins, height, width: torch.linspace(1.0, 0.0, num_bins), False),
         "AutoContrast": (lambda num_bins, height, width: None, False),
         "Equalize": (lambda num_bins, height, width: None, False),
     }
@@ -343,7 +347,7 @@ class RandAugment(_AutoAugmentBase):
         magnitude: int = 9,
         num_magnitude_bins: int = 31,
         interpolation: InterpolationMode = InterpolationMode.NEAREST,
-        fill: Union[features.FillType, Dict[Type, features.FillType]] = None,
+        fill: Union[datapoints.FillType, Dict[Type, datapoints.FillType]] = None,
     ) -> None:
         super().__init__(interpolation=interpolation, fill=fill)
         self.num_ops = num_ops
@@ -383,12 +387,10 @@ class TrivialAugmentWide(_AutoAugmentBase):
         "Contrast": (lambda num_bins, height, width: torch.linspace(0.0, 0.99, num_bins), True),
         "Sharpness": (lambda num_bins, height, width: torch.linspace(0.0, 0.99, num_bins), True),
         "Posterize": (
-            lambda num_bins, height, width: cast(torch.Tensor, 8 - (torch.arange(num_bins) / ((num_bins - 1) / 6)))
-            .round()
-            .int(),
+            lambda num_bins, height, width: (8 - (torch.arange(num_bins) / ((num_bins - 1) / 6))).round().int(),
             False,
         ),
-        "Solarize": (lambda num_bins, height, width: torch.linspace(255.0, 0.0, num_bins), False),
+        "Solarize": (lambda num_bins, height, width: torch.linspace(1.0, 0.0, num_bins), False),
         "AutoContrast": (lambda num_bins, height, width: None, False),
         "Equalize": (lambda num_bins, height, width: None, False),
     }
@@ -397,7 +399,7 @@ class TrivialAugmentWide(_AutoAugmentBase):
         self,
         num_magnitude_bins: int = 31,
         interpolation: InterpolationMode = InterpolationMode.NEAREST,
-        fill: Union[features.FillType, Dict[Type, features.FillType]] = None,
+        fill: Union[datapoints.FillType, Dict[Type, datapoints.FillType]] = None,
     ):
         super().__init__(interpolation=interpolation, fill=fill)
         self.num_magnitude_bins = num_magnitude_bins
@@ -430,12 +432,10 @@ class AugMix(_AutoAugmentBase):
         "TranslateY": (lambda num_bins, height, width: torch.linspace(0.0, height / 3.0, num_bins), True),
         "Rotate": (lambda num_bins, height, width: torch.linspace(0.0, 30.0, num_bins), True),
         "Posterize": (
-            lambda num_bins, height, width: cast(torch.Tensor, 4 - (torch.arange(num_bins) / ((num_bins - 1) / 4)))
-            .round()
-            .int(),
+            lambda num_bins, height, width: (4 - (torch.arange(num_bins) / ((num_bins - 1) / 4))).round().int(),
             False,
         ),
-        "Solarize": (lambda num_bins, height, width: torch.linspace(255.0, 0.0, num_bins), False),
+        "Solarize": (lambda num_bins, height, width: torch.linspace(1.0, 0.0, num_bins), False),
         "AutoContrast": (lambda num_bins, height, width: None, False),
         "Equalize": (lambda num_bins, height, width: None, False),
     }
@@ -455,7 +455,7 @@ class AugMix(_AutoAugmentBase):
         alpha: float = 1.0,
         all_ops: bool = True,
         interpolation: InterpolationMode = InterpolationMode.BILINEAR,
-        fill: Union[features.FillType, Dict[Type, features.FillType]] = None,
+        fill: Union[datapoints.FillType, Dict[Type, datapoints.FillType]] = None,
     ) -> None:
         super().__init__(interpolation=interpolation, fill=fill)
         self._PARAMETER_MAX = 10
@@ -483,7 +483,7 @@ class AugMix(_AutoAugmentBase):
         augmentation_space = self._AUGMENTATION_SPACE if self.all_ops else self._PARTIAL_AUGMENTATION_SPACE
 
         orig_dims = list(image_or_video.shape)
-        expected_ndim = 5 if isinstance(orig_image_or_video, features.Video) else 4
+        expected_ndim = 5 if isinstance(orig_image_or_video, datapoints.Video) else 4
         batch = image_or_video.reshape([1] * max(expected_ndim - image_or_video.ndim, 0) + orig_dims)
         batch_dims = [batch.size(0)] + [1] * (batch.ndim - 1)
 
@@ -520,7 +520,7 @@ class AugMix(_AutoAugmentBase):
             mix.add_(combined_weights[:, i].reshape(batch_dims) * aug)
         mix = mix.reshape(orig_dims).to(dtype=image_or_video.dtype)
 
-        if isinstance(orig_image_or_video, (features.Image, features.Video)):
+        if isinstance(orig_image_or_video, (datapoints.Image, datapoints.Video)):
             mix = orig_image_or_video.wrap_like(orig_image_or_video, mix)  # type: ignore[arg-type]
         elif isinstance(orig_image_or_video, PIL.Image.Image):
             mix = F.to_image_pil(mix)
