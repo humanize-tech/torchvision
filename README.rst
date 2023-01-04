@@ -10,6 +10,17 @@ torchvision
 
 The torchvision package consists of popular datasets, model architectures, and common image transformations for computer vision.
 
+Humanize Tech
+=============
+
+To install this torchvision version from another code source, run: ``pip install git+https://github.com/humanize-tech/torchvision.git@main-multitask``.
+Or clone this repository branch locally and run ``python setup.py install``.
+
+All our changes in comparison with the original torchvision==0.13.1 here:
+
+- 1
+- 2
+- 3
 
 Installation
 ============
